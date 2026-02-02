@@ -11,10 +11,11 @@ Array = jax.Array
 
 from correlation import DTYPE, _as_dtype
 
+
 # -------------------------
 # helpers: safe numerics
 # -------------------------
-def _clamp01(x: Array, eps: float = 1e-8) -> Array:
+def _clamp01(x: Array, eps: float = 1e-6) -> Array:
     # Keep probabilities away from {0,1} to avoid inf in logit, etc.
     return jnp.clip(x, eps, 1.0 - eps)
 
@@ -104,7 +105,7 @@ class Transform:
     inverse: Callable[[Array], Array]
 
 
-def make_transforms_tri(eps: float = 1e-8) -> Dict[str, Transform]:
+def make_transforms(eps: float = 1e-6) -> Dict[str, Transform]:
     """
     Default transform choices for correlation-model parameters.
     """
@@ -163,15 +164,15 @@ def make_transforms_tri(eps: float = 1e-8) -> Dict[str, Transform]:
 
 
 def transform_params(
-    theta_uncon: Dict[str, Array],
+    param_uncon: Dict[str, Array],
     spec: Dict[str, Transform],
 ) -> Dict[str, Array]:
     """
     Map unconstrained -> constrained.
-    Keys in theta_uncon must be in spec.
+    Keys in param_uncon must be in spec.
     """
     out = {}
-    for k, v in theta_uncon.items():
+    for k, v in param_uncon.items():
         if k not in spec:
             raise KeyError(f"Missing transform spec for key '{k}'")
         out[k] = spec[k].forward(v)
@@ -179,14 +180,14 @@ def transform_params(
 
 
 def inverse_transform_params(
-    theta_con: Dict[str, Array],
+    param_con: Dict[str, Array],
     spec: Dict[str, Transform],
 ) -> Dict[str, Array]:
     """
     Map constrained -> unconstrained.
     """
     out = {}
-    for k, v in theta_con.items():
+    for k, v in param_con.items():
         if k not in spec:
             raise KeyError(f"Missing transform spec for key '{k}'")
         out[k] = spec[k].inverse(v)
@@ -196,8 +197,6 @@ def inverse_transform_params(
 # ------------------------------------------------------------------------------
 # A transform registry for parameters for base and lagrangian models
 # ------------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class ParamTransforms:
     base: Dict[str, Transform]
@@ -205,12 +204,12 @@ class ParamTransforms:
 
 
 def transform_model_params(
-    theta_base_uncon: Dict[str, Array],
-    theta_lagr_uncon: Dict[str, Array],
+    param_base_uncon: Dict[str, Array],
+    param_lagr_uncon: Dict[str, Array],
     tfs: ParamTransforms,
 ) -> Tuple[Dict[str, Array], Dict[str, Array]]:
-    par_base = transform_params(theta_base_uncon, tfs.base)
-    par_lagr = transform_params(theta_lagr_uncon, tfs.lagr)
+    par_base = transform_params(param_base_uncon, tfs.base)
+    par_lagr = transform_params(param_lagr_uncon, tfs.lagr)
     return par_base, par_lagr
 
 
@@ -219,6 +218,6 @@ def inverse_transform_model_params(
     par_lagr: Dict[str, Array],
     tfs: ParamTransforms,
 ) -> Tuple[Dict[str, Array], Dict[str, Array]]:
-    theta_base_uncon = inverse_transform_params(par_base, tfs.base)
-    theta_lagr_uncon = inverse_transform_params(par_lagr, tfs.lagr)
-    return theta_base_uncon, theta_lagr_uncon
+    param_base_uncon = inverse_transform_params(par_base, tfs.base)
+    param_lagr_uncon = inverse_transform_params(par_lagr, tfs.lagr)
+    return param_base_uncon, param_lagr_uncon

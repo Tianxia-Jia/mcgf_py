@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,7 @@ except Exception:
     _HAVE_OPTAX = False
 
 from correlation import DTYPE, _as_dtype, cor_stat, cor_base_stat
-from estimate_transform import make_transforms_tri
+from estimate_transform import Transform, make_transforms
 
 Array = jax.Array
 
@@ -58,7 +58,7 @@ class ParamSpec:
 def _pack_init_unconstrained(
     par_init_con: Dict[str, Any],
     param_names: Tuple[str, ...],
-    tf: Dict[str, Any],  # Dict[str, Transform]
+    tf: Dict[str, Transform],  # Dict[str, Transform]
 ) -> Array:
     vals = []
     for k in param_names:
@@ -70,7 +70,7 @@ def _pack_init_unconstrained(
 def _unconstrained_to_constrained_dict(
     x_uncon: Array,
     param_names: Tuple[str, ...],
-    tf: Dict[str, Any],
+    tf: Dict[str, Transform],
 ) -> Dict[str, Array]:
     x_uncon = _as_dtype(x_uncon)
     out: Dict[str, Array] = {}
@@ -82,8 +82,8 @@ def _unconstrained_to_constrained_dict(
 def _split_free_fixed(
     param_names: Tuple[str, ...],
     par_init_con: Dict[str, Any],
-    par_fixed_con: Optional[Dict[str, Any]],
-    tf: Dict[str, Any],
+    par_fixed_con: Optional[Dict[str, Array]],
+    tf: Dict[str, Transform],
 ) -> Tuple[Tuple[str, ...], Array, Dict[str, Array]]:
     """
     Returns:
@@ -178,14 +178,30 @@ def _build_par_lagr(
 # -----------------------------------------------------------------------------
 # Objective functions (WLS)
 # -----------------------------------------------------------------------------
+def _wls_loss(cor_model, cor_emp, eps: float = 1e-6):
+    """
+    JAX equivalent of mcgf:::obj_wls
 
+    R:
+      summand <- ((cor_emp - fitted)/(1 - fitted))^2
+      summand[is.infinite(summand)] <- NA
+      sum(summand, na.rm = TRUE)
+    """
+    fitted = cor_model
+    emp = cor_emp
 
-def _wls_loss(cor_model, cor_emp, w=None):
-    r = (cor_model - cor_emp).ravel()
-    if w is None:
-        return jnp.sum(r * r)
-    ww = w.ravel()
-    return jnp.sum(ww * r * r)
+    denom = 1.0 - fitted
+    n = fitted.shape[0]
+    diag0 = jnp.eye(n, dtype=bool)
+    if fitted.ndim == 3:
+        diag0 = diag0[..., None] & (jnp.arange(fitted.shape[2]) == 0)
+
+    use = ~diag0 & (denom != 0)
+
+    numer = jnp.where(use, emp - fitted, 0.0)
+    denom = jnp.where(use, denom, 1.0)  # never divide by 0
+
+    return jnp.sum((numer / denom) ** 2)
 
 
 def _obj_base_wls(
@@ -195,11 +211,10 @@ def _obj_base_wls(
     h: Array,
     u: Array,
     cor_emp: Array,
-    w: Optional[Array],
     param_names: Tuple[str, ...],
     free_names: Tuple[str, ...],
     fixed_uncon: Dict[str, Array],
-    tf: Dict[str, Any],
+    tf: Dict[str, Transform],
 ) -> Array:
     x_full = _assemble_full_uncon(x_free, free_names, fixed_uncon, param_names)
     par_all = _unconstrained_to_constrained_dict(x_full, param_names, tf)
@@ -215,7 +230,7 @@ def _obj_base_wls(
         u=u,
         base_fixed=False,
     )
-    return _wls_loss(cor_model, cor_emp, w)
+    return _wls_loss(cor_model, cor_emp)
 
 
 def _obj_lagr_wls(
@@ -227,11 +242,10 @@ def _obj_lagr_wls(
     h2: Array,
     u: Array,
     cor_emp: Array,
-    w: Optional[Array],
     param_names: Tuple[str, ...],
     free_names: Tuple[str, ...],
     fixed_uncon: Dict[str, Array],
-    tf: Dict[str, Any],
+    tf: Dict[str, Transform],
 ) -> Array:
     x_full = _assemble_full_uncon(x_free, free_names, fixed_uncon, param_names)
     par_all = _unconstrained_to_constrained_dict(x_full, param_names, tf)
@@ -248,15 +262,14 @@ def _obj_lagr_wls(
         u=u,
         base_fixed=True,
     )
-    resid = cor_model - _as_dtype(cor_emp)
-    return _wls_loss(cor_model, cor_emp, w)
+    return _wls_loss(cor_model, cor_emp)
 
 
 # -----------------------------------------------------------------------------
 # Optimizer runners
 # -----------------------------------------------------------------------------
 def _run_lbfgs(value_and_grad_fn, x0: Array, maxiter: int = 2000) -> Dict[str, Any]:
-    solver = jaxopt.LBFGS(fun=value_and_grad_fn, maxiter=maxiter)
+    solver = jaxopt.LBFGS(fun=value_and_grad_fn, value_and_grad=True, maxiter=maxiter)
     res = solver.run(x0)
     x_star = res.params
     state = res.state
@@ -293,9 +306,101 @@ def _run_adam(
     }
 
 
+def _run_adamw(
+    value_and_grad_fn,
+    x0: Array,
+    maxiter: int = 2000,
+    lr: float = 1e-2,
+    weight_decay: float = 1e-4,
+) -> Dict[str, Any]:
+    if not _HAVE_OPTAX:
+        raise RuntimeError("Need optax installed for AdamW optimization.")
+    opt = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
+    opt_state = opt.init(x0)
+
+    def step(carry, _):
+        x, opt_state = carry
+        val, g = value_and_grad_fn(x)
+        updates, opt_state2 = opt.update(g, opt_state, x)
+        x2 = optax.apply_updates(x, updates)
+        return (x2, opt_state2), val
+
+    (xT, _), vals = jax.lax.scan(step, (x0, opt_state), xs=None, length=maxiter)
+    return {
+        "x_star": xT,
+        "n_iter": int(maxiter),
+        "converged": True,  # treat as "ran maxiter"
+        "message": "ok_adamw",
+        "trace": vals,
+    }
+
+
 # -----------------------------------------------------------------------------
 # Public entrypoints for R routing
 # -----------------------------------------------------------------------------
+
+
+def _run_optimizer(
+    value_and_grad_fn,
+    x0: Array,
+    *,
+    method: str = "auto",
+    control: Dict[str, Any],
+) -> Dict[str, Any]:
+    m = (control.get("method") or method or "auto").lower()
+
+    # normalize aliases
+    if m in ("l-bfgs", "l-bfgs-b"):
+        m = "lbfgs"
+    if m in ("optax", "optax_adam"):
+        m = "adam"
+    if m in ("wadam", "adamw_optax"):
+        m = "adamw"
+
+    if m == "auto":
+        # prefer LBFGS if available, else Adam (or AdamW if you prefer)
+        if _HAVE_JAXOPT:
+            return _run_lbfgs(
+                value_and_grad_fn,
+                x0,
+                maxiter=int(control.get("maxiter", 2000)),
+            )
+        # fallback default when no jaxopt:
+        return _run_adamw(
+            value_and_grad_fn,
+            x0,
+            maxiter=int(control.get("maxiter_adam", control.get("maxiter", 2000))),
+            lr=float(control.get("lr", 1e-2)),
+            weight_decay=float(control.get("weight_decay", 1e-4)),
+        )
+
+    if m == "lbfgs":
+        if not _HAVE_JAXOPT:
+            raise RuntimeError("method='lbfgs' requested but jaxopt is not installed.")
+        return _run_lbfgs(
+            value_and_grad_fn,
+            x0,
+            maxiter=int(control.get("maxiter", 2000)),
+        )
+
+    if m == "adam":
+        return _run_adam(
+            value_and_grad_fn,
+            x0,
+            maxiter=int(control.get("maxiter_adam", control.get("maxiter", 2000))),
+            lr=float(control.get("lr", 1e-2)),
+        )
+
+    if m == "adamw":
+        return _run_adamw(
+            value_and_grad_fn,
+            x0,
+            maxiter=int(control.get("maxiter_adam", control.get("maxiter", 2000))),
+            lr=float(control.get("lr", 1e-2)),
+            weight_decay=float(control.get("weight_decay", 1e-4)),
+        )
+
+    raise ValueError(f"Unknown method='{m}'. Use 'auto', 'lbfgs', 'adam', or 'adamw'.")
 
 
 def jax_fit_base_one(
@@ -304,11 +409,11 @@ def jax_fit_base_one(
     h: Any,
     u: Any,
     cor_emp: Any,
-    weights: Optional[Any] = None,
     par_init: Dict[str, Any],
     par_fixed: Optional[Dict[str, Any]] = None,
+    method: str = "auto",
     control: Optional[Dict[str, Any]] = None,
-    transforms: Optional[Dict[str, Any]] = None,  # Dict[str, Transform]
+    transforms: Optional[Dict[str, Transform]] = None,
 ) -> Dict[str, Any]:
     """
     Base-only WLS fit. Returns an 'optim-like' result dict compatible with R wrappers.
@@ -319,9 +424,8 @@ def jax_fit_base_one(
     h = _as_dtype(h)
     u = _as_dtype(u)
     cor_emp = _as_dtype(cor_emp)
-    w = None if weights is None else _as_dtype(weights)
 
-    tf = transforms if transforms is not None else make_transforms_tri()
+    tf = transforms if transforms is not None else make_transforms()
 
     # Parameters needed for base models
     base_param_names = ("nugget", "c", "gamma", "a", "alpha", "beta")
@@ -336,7 +440,6 @@ def jax_fit_base_one(
             h=h,
             u=u,
             cor_emp=cor_emp,
-            w=w,
             param_names=base_param_names,
             free_names=free_names,
             fixed_uncon=fixed_uncon,
@@ -345,15 +448,7 @@ def jax_fit_base_one(
 
     value_and_grad = jax.value_and_grad(f)
 
-    if _HAVE_JAXOPT:
-        opt_res = _run_lbfgs(value_and_grad, x0_free, maxiter=maxiter)
-    else:
-        opt_res = _run_adam(
-            value_and_grad,
-            x0_free,
-            maxiter=int(control.get("maxiter_adam", 2000)),
-            lr=float(control.get("lr", 1e-2)),
-        )
+    opt_res = _run_optimizer(value_and_grad, x0_free, method=method, control=control)
 
     x_star_free = opt_res["x_star"]
     x_star_full = _assemble_full_uncon(
@@ -384,11 +479,11 @@ def jax_fit_lagr_one(
     h2: Any,
     u: Any,
     cor_emp: Any,
-    weights: Optional[Any] = None,
     par_init: Dict[str, Any],
     par_fixed: Optional[Dict[str, Any]] = None,
+    method: str = "auto",
     control: Optional[Dict[str, Any]] = None,
-    transforms: Optional[Dict[str, Any]] = None,
+    transforms: Optional[Dict[str, Transform]] = None,
 ) -> Dict[str, Any]:
     """
     Lagrangian-only WLS fit with base fixed (regime-switching friendly).
@@ -401,9 +496,8 @@ def jax_fit_lagr_one(
     h2 = _as_dtype(h2)
     u = _as_dtype(u)
     cor_emp = _as_dtype(cor_emp)
-    w = None if weights is None else _as_dtype(weights)
 
-    tf = transforms if transforms is not None else make_transforms_tri()
+    tf = transforms if transforms is not None else make_transforms()
 
     lagr_param_names = ("lam", "v1", "v2", "k")
     free_names, x0_free, fixed_uncon = _split_free_fixed(
@@ -419,7 +513,6 @@ def jax_fit_lagr_one(
             h2=h2,
             u=u,
             cor_emp=cor_emp,
-            w=w,
             param_names=lagr_param_names,
             free_names=free_names,
             fixed_uncon=fixed_uncon,
@@ -428,15 +521,7 @@ def jax_fit_lagr_one(
 
     value_and_grad = jax.value_and_grad(f)
 
-    if _HAVE_JAXOPT:
-        opt_res = _run_lbfgs(value_and_grad, x0_free, maxiter=maxiter)
-    else:
-        opt_res = _run_adam(
-            value_and_grad,
-            x0_free,
-            maxiter=int(control.get("maxiter_adam", 2000)),
-            lr=float(control.get("lr", 1e-2)),
-        )
+    opt_res = _run_optimizer(value_and_grad, x0_free, method=method, control=control)
 
     x_star_free = opt_res["x_star"]
     x_star_full = _assemble_full_uncon(
@@ -473,7 +558,7 @@ def compute_base_corr(
     h = _as_dtype(h)
     u = _as_dtype(u)
 
-    rho = cor_stat(
+    cor_base = cor_stat(
         base=base,
         lagrangian="none",
         par_base=par_base,
@@ -484,7 +569,7 @@ def compute_base_corr(
         base_fixed=False,
     )
 
-    return _tree_to_py({"base_corr": rho})
+    return _tree_to_py({"base_corr": cor_base})
 
 
 # ------------------------------------------------------------------------------
@@ -509,7 +594,3 @@ def _check_lagr_inputs(h1, h2, u, cor_emp, base_corr, w=None):
     _assert_same_shape("base_corr", base_corr, "cor_emp", cor_emp)
     if w is not None:
         _assert_same_shape("weights", w, "cor_emp", cor_emp)
-
-
-_check_base_inputs(h, u, rho_hat, w)
-_check_lagr_inputs(h1, h2, u, rho_hat, base_corr, w)

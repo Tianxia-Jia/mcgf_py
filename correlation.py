@@ -88,7 +88,7 @@ def cor_cauchy(
     nu = _as_dtype(nu)
     nugget = _as_dtype(nugget)
 
-    base = (a * jnp.abs(x) ** (2.0 * alpha) + 1.0) ** (-nu)
+    base = (a * _abs_pow_safe(x, 2.0 * alpha) + 1.0) ** (-nu)
     return (
         add_nugget(base, nugget)
         if base.ndim in (2, 3)
@@ -188,6 +188,17 @@ def cor_lagr_tri(
 # ------------------------------------------------------------------------------#
 # Composite kernels (dense)
 # ------------------------------------------------------------------------------#
+
+def _abs_pow_safe(x, p, tiny=1e-12):
+    """Compute |x|^p with finite grads w.r.t. p at x=0."""
+    ax = jnp.abs(x)
+    # keep log finite everywhere (even where ax==0)
+    logax = jnp.log(jnp.maximum(ax, tiny))
+    y = jnp.exp(p * logax)
+    # enforce exact 0 at ax==0 (and keep grads finite)
+    return jnp.where(ax == 0, 0.0, y)
+
+
 @jax.jit(static_argnames=("spatial", "temporal"))
 def cor_sep(
     h: Array,
@@ -282,10 +293,11 @@ def cor_fs(
     alpha = _as_dtype(alpha)
     beta = _as_dtype(beta)
 
-    tu = a * jnp.abs(u) ** (2.0 * alpha) + 1.0
+    pu = _abs_pow_safe(u, 2.0 * alpha)
+    ph = _abs_pow_safe(h, 2.0 * gamma)   
+    tu = a * pu + 1.0
     scale = tu ** (beta * gamma)
-
-    exp_term = jnp.exp(-c * (jnp.abs(h) ** (2.0 * gamma)) / scale)
+    exp_term = jnp.exp(-c * ph / scale)
     C_raw = exp_term / tu
     set_to = 1.0 / tu
     return set_nugget(C_raw, nugget=nugget, set_to=set_to)
@@ -457,7 +469,7 @@ def cor_stat(
     lagrangian: Literal["none", "lagr_tri", "lagr_exp", "lagr_askey"] = "none",
     par_base: Dict[str, Any] | None = None,
     par_lagr: Dict[str, Any] | None = None,
-    lam: Array | float,
+    lam: Array | float = 0.0,
     h: Array | None = None,
     h1: Array | None = None,
     h2: Array | None = None,
