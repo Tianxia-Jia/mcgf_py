@@ -268,8 +268,8 @@ def _obj_lagr_wls(
 # -----------------------------------------------------------------------------
 # Optimizer runners
 # -----------------------------------------------------------------------------
-def _run_lbfgs(value_and_grad_fn, x0: Array, maxiter: int = 2000) -> Dict[str, Any]:
-    solver = jaxopt.LBFGS(fun=value_and_grad_fn, value_and_grad=True, maxiter=maxiter)
+def _run_lbfgs(value_and_grad_fn, x0: Array, **kwargs) -> Dict[str, Any]:
+    solver = jaxopt.LBFGS(fun=value_and_grad_fn, value_and_grad=True, **kwargs)
     res = solver.run(x0)
     x_star = res.params
     state = res.state
@@ -278,15 +278,16 @@ def _run_lbfgs(value_and_grad_fn, x0: Array, maxiter: int = 2000) -> Dict[str, A
         "n_iter": int(state.iter_num),
         "converged": bool(state.error <= solver.tol),
         "message": "ok" if bool(state.error <= solver.tol) else "not_converged",
+        "trace": None,
     }
 
 
 def _run_adam(
-    value_and_grad_fn, x0: Array, maxiter: int = 2000, lr: float = 1e-2
+    value_and_grad_fn, x0: Array, maxiter: int = 10000, **kwargs
 ) -> Dict[str, Any]:
     if not _HAVE_OPTAX:
         raise RuntimeError("Need jaxopt or optax installed for optimization.")
-    opt = optax.adam(lr)
+    opt = optax.adam(**kwargs)
     opt_state = opt.init(x0)
 
     def step(carry, _):
@@ -299,23 +300,19 @@ def _run_adam(
     (xT, _), vals = jax.lax.scan(step, (x0, opt_state), xs=None, length=maxiter)
     return {
         "x_star": xT,
-        "n_iter": int(maxiter),
-        "converged": True,  # ADAM: treat as "ran maxiter"
+        "n_iter": maxiter,
+        "converged": True,
         "message": "ok_adam",
         "trace": vals,
     }
 
 
 def _run_adamw(
-    value_and_grad_fn,
-    x0: Array,
-    maxiter: int = 2000,
-    lr: float = 1e-2,
-    weight_decay: float = 1e-4,
+    value_and_grad_fn, x0: Array, maxiter: int = 10000, **kwargs
 ) -> Dict[str, Any]:
     if not _HAVE_OPTAX:
         raise RuntimeError("Need optax installed for AdamW optimization.")
-    opt = optax.adamw(learning_rate=lr, weight_decay=weight_decay)
+    opt = optax.adamw(**kwargs)
     opt_state = opt.init(x0)
 
     def step(carry, _):
@@ -328,8 +325,8 @@ def _run_adamw(
     (xT, _), vals = jax.lax.scan(step, (x0, opt_state), xs=None, length=maxiter)
     return {
         "x_star": xT,
-        "n_iter": int(maxiter),
-        "converged": True,  # treat as "ran maxiter"
+        "n_iter": maxiter,
+        "converged": True,
         "message": "ok_adamw",
         "trace": vals,
     }
@@ -338,14 +335,13 @@ def _run_adamw(
 # -----------------------------------------------------------------------------
 # Public entrypoints for R routing
 # -----------------------------------------------------------------------------
-
-
 def _run_optimizer(
     value_and_grad_fn,
     x0: Array,
     *,
     method: str = "auto",
     control: Dict[str, Any],
+    maxiter: Optional[int],
 ) -> Dict[str, Any]:
     m = (control.get("method") or method or "auto").lower()
 
@@ -360,45 +356,20 @@ def _run_optimizer(
     if m == "auto":
         # prefer LBFGS if available, else Adam (or AdamW if you prefer)
         if _HAVE_JAXOPT:
-            return _run_lbfgs(
-                value_and_grad_fn,
-                x0,
-                maxiter=int(control.get("maxiter", 2000)),
-            )
+            return _run_lbfgs(value_and_grad_fn, x0, **control)
         # fallback default when no jaxopt:
-        return _run_adamw(
-            value_and_grad_fn,
-            x0,
-            maxiter=int(control.get("maxiter_adam", control.get("maxiter", 2000))),
-            lr=float(control.get("lr", 1e-2)),
-            weight_decay=float(control.get("weight_decay", 1e-4)),
-        )
+        return _run_adamw(value_and_grad_fn, x0, maxiter, **control)
 
     if m == "lbfgs":
         if not _HAVE_JAXOPT:
             raise RuntimeError("method='lbfgs' requested but jaxopt is not installed.")
-        return _run_lbfgs(
-            value_and_grad_fn,
-            x0,
-            maxiter=int(control.get("maxiter", 2000)),
-        )
+        return _run_lbfgs(value_and_grad_fn, x0, **control)
 
     if m == "adam":
-        return _run_adam(
-            value_and_grad_fn,
-            x0,
-            maxiter=int(control.get("maxiter_adam", control.get("maxiter", 2000))),
-            lr=float(control.get("lr", 1e-2)),
-        )
+        return _run_adam(value_and_grad_fn, x0, maxiter, **control)
 
     if m == "adamw":
-        return _run_adamw(
-            value_and_grad_fn,
-            x0,
-            maxiter=int(control.get("maxiter_adam", control.get("maxiter", 2000))),
-            lr=float(control.get("lr", 1e-2)),
-            weight_decay=float(control.get("weight_decay", 1e-4)),
-        )
+        return _run_adamw(value_and_grad_fn, x0, maxiter, **control)
 
     raise ValueError(f"Unknown method='{m}'. Use 'auto', 'lbfgs', 'adam', or 'adamw'.")
 
@@ -413,13 +384,13 @@ def jax_fit_base_one(
     par_fixed: Optional[Dict[str, Any]] = None,
     method: str = "auto",
     control: Optional[Dict[str, Any]] = None,
+    maxiter: Optional[int] = 10000,
     transforms: Optional[Dict[str, Transform]] = None,
 ) -> Dict[str, Any]:
     """
     Base-only WLS fit. Returns an 'optim-like' result dict compatible with R wrappers.
     """
     control = control or {}
-    maxiter = int(control.get("maxiter", 200))
 
     h = _as_dtype(h)
     u = _as_dtype(u)
@@ -448,7 +419,9 @@ def jax_fit_base_one(
 
     value_and_grad = jax.value_and_grad(f)
 
-    opt_res = _run_optimizer(value_and_grad, x0_free, method=method, control=control)
+    opt_res = _run_optimizer(
+        value_and_grad, x0_free, method=method, control=control, maxiter=maxiter
+    )
 
     x_star_free = opt_res["x_star"]
     x_star_full = _assemble_full_uncon(
@@ -466,6 +439,7 @@ def jax_fit_base_one(
             "converged": opt_res["converged"],
             "n_iter": opt_res["n_iter"],
             "message": opt_res.get("message", ""),
+            "trace": opt_res["trace"],
             "backend": "jax",
         }
     )
@@ -483,13 +457,13 @@ def jax_fit_lagr_one(
     par_fixed: Optional[Dict[str, Any]] = None,
     method: str = "auto",
     control: Optional[Dict[str, Any]] = None,
+    maxiter: Optional[int] = 10000,
     transforms: Optional[Dict[str, Transform]] = None,
 ) -> Dict[str, Any]:
     """
     Lagrangian-only WLS fit with base fixed (regime-switching friendly).
     """
     control = control or {}
-    maxiter = int(control.get("maxiter", 200))
 
     base_corr = _as_dtype(base_corr)
     h1 = _as_dtype(h1)
@@ -521,7 +495,9 @@ def jax_fit_lagr_one(
 
     value_and_grad = jax.value_and_grad(f)
 
-    opt_res = _run_optimizer(value_and_grad, x0_free, method=method, control=control)
+    opt_res = _run_optimizer(
+        value_and_grad, x0_free, method=method, maxiter=maxiter, control=control
+    )
 
     x_star_free = opt_res["x_star"]
     x_star_full = _assemble_full_uncon(
@@ -540,6 +516,7 @@ def jax_fit_lagr_one(
             "converged": opt_res["converged"],
             "n_iter": opt_res["n_iter"],
             "message": opt_res.get("message", ""),
+            "trace": opt_res["trace"],
             "backend": "jax",
         }
     )
@@ -572,6 +549,175 @@ def compute_base_corr(
     return _tree_to_py({"base_corr": cor_base})
 
 
+# -----------------------------------------------------------------------------
+# Joint (base + lagrangian) objective + fitter
+# -----------------------------------------------------------------------------
+def _obj_all_wls(
+    x_free: Array,
+    *,
+    base: str,  # "sep" or "fs"
+    lagrangian: str,  # "none"|"lagr_tri"|"lagr_exp"|"lagr_askey"
+    h: Array,
+    h1: Array,
+    h2: Array,
+    u: Array,
+    cor_emp: Array,
+    param_names: Tuple[str, ...],
+    free_names: Tuple[str, ...],
+    fixed_uncon: Dict[str, Array],
+    tf: Dict[str, Transform],
+) -> Array:
+
+    x_full = _assemble_full_uncon(x_free, free_names, fixed_uncon, param_names)
+    par_all = _unconstrained_to_constrained_dict(x_full, param_names, tf)
+
+    # base params always needed
+    par_base = _build_par_base(base, par_all)
+
+    if lagrangian == "none":
+        cor_model = cor_stat(
+            base=base,
+            lagrangian="none",
+            par_base=par_base,
+            par_lagr=None,
+            lam=0.0,
+            h=h,
+            u=u,
+            base_fixed=False,
+        )
+        return _wls_loss(cor_model, cor_emp)
+
+    par_lagr, lam = _build_par_lagr(lagrangian, par_all)
+
+    cor_model = cor_stat(
+        base=base,
+        lagrangian=lagrangian,
+        par_base=par_base,
+        par_lagr=par_lagr,
+        lam=lam,
+        h=h,
+        h1=h1,
+        h2=h2,
+        u=u,
+        base_fixed=False,
+    )
+    return _wls_loss(cor_model, cor_emp)
+
+
+def jax_fit_all_one(
+    *,
+    base: str,  # "sep" or "fs"
+    lagrangian: str,  # "none"|"lagr_tri"|"lagr_exp"|"lagr_askey"
+    h: Any,
+    u: Any,
+    cor_emp: Any,
+    # only required when lagrangian != "none"
+    h1: Any = None,
+    h2: Any = None,
+    par_init: Dict[str, Any] = None,
+    par_fixed: Optional[Dict[str, Any]] = None,
+    method: str = "auto",
+    control: Optional[Dict[str, Any]] = None,
+    maxiter: Optional[int] = 10000,
+    transforms: Optional[Dict[str, Transform]] = None,
+) -> Dict[str, Any]:
+    """
+    Joint WLS fit: estimate base + lagrangian parameters (and lam) in one optimizer run.
+
+    Expected par_init keys:
+      base params:  nugget, c, gamma, a, alpha, beta
+      lagr params:  lam, v1, v2, k   (only if lagrangian != "none")
+
+    par_fixed: optional dict of constrained values for any subset of those keys.
+    """
+    if par_init is None:
+        raise ValueError("par_init is required.")
+
+    control = control or {}
+
+    h = _as_dtype(h)
+    u = _as_dtype(u)
+    cor_emp = _as_dtype(cor_emp)
+
+    tf = transforms if transforms is not None else make_transforms()
+
+    # Parameter list depends on whether lagrangian is used
+    base_param_names = ("nugget", "c", "gamma", "a", "alpha", "beta")
+    lagr_param_names = ("lam", "v1", "v2", "k")
+
+    if lagrangian == "none":
+        param_names = base_param_names
+    else:
+        if h1 is None or h2 is None:
+            raise ValueError("h1 and h2 are required when lagrangian != 'none'.")
+        h1 = _as_dtype(h1)
+        h2 = _as_dtype(h2)
+        param_names = base_param_names + lagr_param_names
+
+    # same fixed/free logic you already use
+    free_names, x0_free, fixed_uncon = _split_free_fixed(
+        param_names, par_init, par_fixed, tf
+    )
+
+    def f(x):
+        return _obj_all_wls(
+            x,
+            base=base,
+            lagrangian=lagrangian,
+            h=h,
+            h1=_as_dtype(h1) if lagrangian != "none" else jnp.asarray(0.0, dtype=DTYPE),
+            h2=_as_dtype(h2) if lagrangian != "none" else jnp.asarray(0.0, dtype=DTYPE),
+            u=u,
+            cor_emp=cor_emp,
+            param_names=param_names,
+            free_names=free_names,
+            fixed_uncon=fixed_uncon,
+            tf=tf,
+        )
+
+    value_and_grad = jax.value_and_grad(f)
+    opt_res = _run_optimizer(
+        value_and_grad, x0_free, method=method, maxiter=maxiter, control=control
+    )
+
+    x_star_free = opt_res["x_star"]
+    x_star_full = _assemble_full_uncon(
+        x_star_free, free_names, fixed_uncon, param_names
+    )
+    par_all_hat = _unconstrained_to_constrained_dict(x_star_full, param_names, tf)
+
+    par_base_hat = _build_par_base(base, par_all_hat)
+
+    if lagrangian == "none":
+        out = {
+            "par_base": par_base_hat,
+            "par_lagr": None,
+            "lam": 0.0,
+            "objective": float(f(x_star_free)),
+            "converged": opt_res["converged"],
+            "n_iter": opt_res["n_iter"],
+            "message": opt_res.get("message", ""),
+            "trace": opt_res["trace"],
+            "backend": "jax",
+        }
+        return _tree_to_py(out)
+
+    par_lagr_hat, lam_hat = _build_par_lagr(lagrangian, par_all_hat)
+
+    out = {
+        "par_base": par_base_hat,
+        "par_lagr": par_lagr_hat,
+        "lam": lam_hat,
+        "objective": float(f(x_star_free)),
+        "converged": opt_res["converged"],
+        "n_iter": opt_res["n_iter"],
+        "message": opt_res.get("message", ""),
+        "trace": opt_res["trace"],
+        "backend": "jax",
+    }
+    return _tree_to_py(out)
+
+
 # ------------------------------------------------------------------------------
 # Check inputs' shape
 # ------------------------------------------------------------------------------
@@ -587,10 +733,9 @@ def _check_base_inputs(h, u, cor_emp, w=None):
         _assert_same_shape("weights", w, "cor_emp", cor_emp)
 
 
-def _check_lagr_inputs(h1, h2, u, cor_emp, base_corr, w=None):
+def _check_lagr_inputs(h1, h2, u, cor_emp, base_corr=None):
     _assert_same_shape("h1", h1, "cor_emp", cor_emp)
     _assert_same_shape("h2", h2, "cor_emp", cor_emp)
     _assert_same_shape("u", u, "cor_emp", cor_emp)
-    _assert_same_shape("base_corr", base_corr, "cor_emp", cor_emp)
-    if w is not None:
-        _assert_same_shape("weights", w, "cor_emp", cor_emp)
+    if base_corr is not None:
+        _assert_same_shape("base_corr", base_corr, "cor_emp", cor_emp)
