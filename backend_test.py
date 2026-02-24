@@ -306,7 +306,7 @@ res = jax_fit_all_one(
     cor_emp=cor_emp_j,
     par_init=par_init_base | par_init_lagr,
     par_fixed=par_fixed,
-    control={"learning_rate": 0.002},
+    control={"learning_rate": 0.02},
     maxiter=500000,
     method="adam",
 )
@@ -331,7 +331,7 @@ res = jax_fit_all_one(
     par_init=par_init_base | par_init_lagr,
     par_fixed=par_fixed,
     control={"learning_rate": 0.002},
-    maxiter=500000,
+    maxiter=100000,
     method="adamw",
 )
 

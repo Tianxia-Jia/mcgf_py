@@ -23,7 +23,7 @@ try:
 except Exception:
     _HAVE_OPTAX = False
 
-from correlation import DTYPE, _as_dtype, cor_stat, cor_base_stat
+from correlation import DTYPE, _as_dtype, cor_stat
 from estimate_transform import Transform, make_transforms
 
 Array = jax.Array
@@ -178,7 +178,7 @@ def _build_par_lagr(
 # -----------------------------------------------------------------------------
 # Objective functions (WLS)
 # -----------------------------------------------------------------------------
-def _wls_loss(cor_model, cor_emp, eps: float = 1e-6):
+def _wls_loss(cor_model, cor_emp):
     """
     JAX equivalent of mcgf:::obj_wls
 
@@ -616,10 +616,11 @@ def jax_fit_all_one(
     h2: Any = None,
     par_init: Dict[str, Any] = None,
     par_fixed: Optional[Dict[str, Any]] = None,
+    transforms: Optional[Dict[str, Transform]] = None,
+    # optimizer
     method: str = "auto",
     control: Optional[Dict[str, Any]] = None,
     maxiter: Optional[int] = 10000,
-    transforms: Optional[Dict[str, Transform]] = None,
 ) -> Dict[str, Any]:
     """
     Joint WLS fit: estimate base + lagrangian parameters (and lam) in one optimizer run.
@@ -686,36 +687,29 @@ def jax_fit_all_one(
     )
     par_all_hat = _unconstrained_to_constrained_dict(x_star_full, param_names, tf)
 
+    # unpack for reporting
     par_base_hat = _build_par_base(base, par_all_hat)
 
     if lagrangian == "none":
-        out = {
+        par_lagr_hat, lam_hat = None, 0.0
+    else:
+        par_lagr_hat, lam_hat = _build_par_lagr(lagrangian, par_all_hat)
+
+    obj_val = float(f(x_star_free))
+
+    return _tree_to_py(
+        {
             "par_base": par_base_hat,
-            "par_lagr": None,
-            "lam": 0.0,
-            "objective": float(f(x_star_free)),
+            "par_lagr": par_lagr_hat,
+            "lam": lam_hat,
+            "objective": obj_val,
             "converged": opt_res["converged"],
             "n_iter": opt_res["n_iter"],
             "message": opt_res.get("message", ""),
             "trace": opt_res["trace"],
             "backend": "jax",
         }
-        return _tree_to_py(out)
-
-    par_lagr_hat, lam_hat = _build_par_lagr(lagrangian, par_all_hat)
-
-    out = {
-        "par_base": par_base_hat,
-        "par_lagr": par_lagr_hat,
-        "lam": lam_hat,
-        "objective": float(f(x_star_free)),
-        "converged": opt_res["converged"],
-        "n_iter": opt_res["n_iter"],
-        "message": opt_res.get("message", ""),
-        "trace": opt_res["trace"],
-        "backend": "jax",
-    }
-    return _tree_to_py(out)
+    )
 
 
 # ------------------------------------------------------------------------------
