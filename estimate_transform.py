@@ -115,13 +115,25 @@ def make_transforms(eps: float = 1e-6) -> Dict[str, Transform]:
             forward=lambda x: unit_interval(x, eps=eps),
             inverse=lambda y: unit_interval_inv(y, eps=eps),
         ),
+        "lds_nugget": Transform(
+            forward=lambda x: unit_interval(x, eps=eps),
+            inverse=lambda y: unit_interval_inv(y, eps=eps),
+        ),
         # c > 0, but restricted to (0,0.5] for numerical stability
         "c": Transform(
-            forward=lambda x: bounded(x, lo=0.0, hi=0.5, eps=eps),
-            inverse=lambda y: bounded_inv(y, lo=0.0, hi=0.5, eps=eps),
+            forward=lambda x: bounded(x, lo=0.0, hi=1, eps=eps),
+            inverse=lambda y: bounded_inv(y, lo=0.0, hi=1, eps=eps),
+        ),
+        "lds_c": Transform(
+            forward=lambda x: bounded(x, lo=0.0, hi=1, eps=eps),
+            inverse=lambda y: bounded_inv(y, lo=0.0, hi=1, eps=eps),
         ),
         # gamma in (0,0.5]
         "gamma": Transform(
+            forward=lambda x: bounded(x, lo=0.0, hi=0.5, eps=eps),
+            inverse=lambda y: bounded_inv(y, lo=0.0, hi=0.5, eps=eps),
+        ),
+        "lds_gamma": Transform(
             forward=lambda x: bounded(x, lo=0.0, hi=0.5, eps=eps),
             inverse=lambda y: bounded_inv(y, lo=0.0, hi=0.5, eps=eps),
         ),

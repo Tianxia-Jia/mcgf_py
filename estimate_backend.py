@@ -175,6 +175,24 @@ def _build_par_lagr(
     )
 
 
+def _build_par_lds(
+    lagrangian: str, par_all_con: Dict[str, Array]
+) -> Tuple[Optional[Dict[str, Any]], Array]:
+    if lagrangian == "none":
+        return None, jnp.asarray(0.0, dtype=DTYPE)
+    elif lagrangian == "exp":
+        return (
+            {
+                "nugget": par_all_con["lds_nugget"],
+                "c": par_all_con["lds_c"],
+                "gamma": par_all_con["lds_gamma"],
+            },
+            par_all_con["lam"],
+        )
+    else:
+        raise ValueError(f"Unknown lagrangian='{lagrangian}'. Use 'none' or 'exp'.")
+
+
 # -----------------------------------------------------------------------------
 # Objective functions (WLS)
 # -----------------------------------------------------------------------------

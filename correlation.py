@@ -189,6 +189,7 @@ def cor_lagr_tri(
 # Composite kernels (dense)
 # ------------------------------------------------------------------------------#
 
+
 def _abs_pow_safe(x, p, tiny=1e-12):
     """Compute |x|^p with finite grads w.r.t. p at x=0."""
     ax = jnp.abs(x)
@@ -294,7 +295,7 @@ def cor_fs(
     beta = _as_dtype(beta)
 
     pu = _abs_pow_safe(u, 2.0 * alpha)
-    ph = _abs_pow_safe(h, 2.0 * gamma)   
+    ph = _abs_pow_safe(h, 2.0 * gamma)
     tu = a * pu + 1.0
     scale = tu ** (beta * gamma)
     exp_term = jnp.exp(-c * ph / scale)
@@ -371,6 +372,29 @@ def cor_lagr_stat(
         return cor_lagr_askey(h1=h1, h2=h2, u=u, v1=v1, v2=v2, k=k)
 
     raise ValueError("cor_lagr_stat: invalid lagrangian choice.")
+
+
+@jax.jit(static_argnames=("lagrangian",))
+def cor_lagr_lds(
+    *,
+    lagrangian: Literal["exp"],
+    par_lagr: Dict[str, Any],
+    h_lds: Array,
+) -> Array:
+    if par_lagr is None:
+        raise ValueError("cor_lagr_lds: par_lagr is required.")
+    if h_lds is None:
+        raise ValueError("cor_lagr_lds: h_lds is required.")
+
+    h_lds = _as_dtype(h_lds)
+    nugget = _as_dtype(par_lagr["nugget"])
+    c = _as_dtype(par_lagr["c"])
+    gamma = _as_dtype(par_lagr["gamma"])
+
+    if lagrangian == "exp":
+        return cor_exp(x=h_lds, nugget=nugget, c=c, gamma=gamma)
+
+    raise ValueError("cor_lagr_lds: invalid lagrangian choice.")
 
 
 @jax.jit(static_argnames=("base", "lagrangian"))
