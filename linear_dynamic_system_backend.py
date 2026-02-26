@@ -191,7 +191,7 @@ def _stationary_cov_scan_fp(
 
         def update_fn(_):
             Pn = F @ cov @ F.T + Q
-            errn = jnp.max(jnp.abs(Pn - cov))
+            errn = jnp.linalg.norm(Pn - cov)
             done_n = errn <= tol
             return Pn, errn, done_n
 
@@ -292,7 +292,7 @@ def stationary_cov_solve(
     Q: jnp.ndarray,
     *,
     ridge: float = 0.0,
-    fp_method: FpMethod = "jaxopt_anderson",
+    fp_method: FpMethod = "scan_fp",
     fp_control: Optional[Dict[str, Any]] = None,
 ) -> jnp.ndarray:
     """
@@ -372,7 +372,7 @@ def stationary_corr_from_model_corrs(
     *,
     n: int,
     lag: int,
-    fp_method: FpMethod = "jaxopt_anderson",
+    fp_method: FpMethod = "scan_fp",
     fp_control: Optional[Dict[str, Any]] = None,
     ridge: float = RIDGE,
 ) -> Array:
@@ -418,7 +418,7 @@ def jax_fit_all(
     par_fixed: Optional[Dict[str, Any]] = None,
     transforms: Optional[Dict[str, Transform]] = None,
     # fixed-point controls:
-    fp_method: FpMethod = "jaxopt_anderson",
+    fp_method: FpMethod = "scan_fp",
     fp_control: Optional[Dict[str, Any]] = None,
     ridge: float = RIDGE,
     # optimizer
