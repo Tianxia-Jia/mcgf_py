@@ -20,7 +20,7 @@ u <- mcgf:::to_ar(dists$h, lag_max = lag)$u
 h <- mcgf:::to_ar(dists$h, lag_max = lag)$h
 h_novel <- find_dists(locations, longlat = TRUE)$h
 
-par_base <- list(nugget = 0, c = 0.001, gamma = 0.5, a = 5, alpha = 0.7, beta = 0.7)
+par_base <- list(nugget = 0, c = 0.001, gamma = 0.5, a = 5, alpha = 0.7, beta = 0.0)
 par_lagr <- list(c = 0.2, gamma = 0.25)
 lambda <- 0.3
 
@@ -111,13 +111,18 @@ lag = lag_max - 1
 par_base_true = meta["par_base"]
 par_lagr_true = meta["par_lagr"]
 lam_true = float(meta["lambda"])
-
+par_true = [par_base_true, par_lagr_true, lam_true]
 
 # -------------------------------------------------------------------------------
 # Convert to JAX + run base-only WLS fit (using our helpers)
 # -------------------------------------------------------------------------------
 import jax.numpy as jnp
-from linear_dynamic_system_backend import jax_fit_all
+from linear_dynamic_system_backend import (
+    jax_fit_all,
+    jax_fit_base_one,
+    jax_fit_lagr_one,
+    compute_base_corr,
+)
 
 # Convert to JAX arrays (dtype follows your correlation.DTYPE)
 cor_emp_j = jnp.asarray(cor_emp)
@@ -141,30 +146,54 @@ par_init = {
 
 par_fixed = {"nugget": 0.0, "lds_nugget": 0.0}
 
-# ============================================================
-# Grid definitions (edit freely)
-# ============================================================
-fp_control = {"fp_tol": 1e-1, "fp_maxiter": 100}
 
-fp_list = [
-    ("scan_fp", dict(fp_method="scan_fp", fp_control=fp_control)),
-    ("jaxopt_fpi", dict(fp_method="jaxopt_fpi", fp_control=fp_control)),
-    (
-        "jaxopt_anderson",
-        dict(fp_method="jaxopt_anderson", fp_control=fp_control),
-    ),
+# ============================================================
+# Grid definitions
+# ============================================================
+def print_res(title, res, dt):
+    print("\n" + "-" * 80)
+    print(title)
+    print("-" * 80)
+    print("sec:", dt)
+    print("converged:", res.get("converged"))
+    print("n_iter:", res.get("n_iter"))
+    print("objective:", res.get("objective"))
+    if "lam" in res:
+        print("lam:", res.get("lam"))
+    if "par_base" in res:
+        print("par_base:", res.get("par_base"))
+    if "par_lagr" in res:
+        print("par_lagr:", res.get("par_lagr"))
+
+
+fp_controls = [
+    {"tol": 1e-1, "maxiter": 100},
+    {"tol": 1e-2, "maxiter": 500},
+    {"tol": 1e-3, "maxiter": 500},
 ]
+fp_methods = ["jaxopt_fpi", "jaxopt_anderson"]
+
+fp_list = []
+for fp_control in fp_controls:
+    for method in fp_methods:
+        name = f"{method}_tol{fp_control['tol']}_iter{fp_control['maxiter']}"
+        fp_list.append(
+            (
+                name,
+                dict(fp_method=method, fp_control=fp_control),
+            )
+        )
 
 opt_list = [
-    (
-        "auto_lbfgs",
-        dict(method="auto", control={"maxiter": 5000, "max_stepsize": 0.01}),
-    ),
-    ("adam", dict(method="adam", maxiter=10000, control={"learning_rate": 0.1})),
-    ("adamw", dict(method="adamw", maxiter=10000, control={"learning_rate": 0.1})),
+    # (
+    #     "auto_lbfgs",
+    #     dict(method="auto", control={"maxiter": 5000, "max_stepsize": 0.01}),
+    # ),
+    ("adam", dict(method="adam", maxiter=50000, control={"learning_rate": 0.1})),
+    ("adamw", dict(method="adamw", maxiter=50000, control={"learning_rate": 0.1})),
 ]
 
-
+print("true:", par_true)
 for opt_name, opt_kw in opt_list:
     for fp_name, fp_kw in fp_list:
         name = f"{opt_name}__{fp_name}"
@@ -172,8 +201,55 @@ for opt_name, opt_kw in opt_list:
         print(name)
         print("=" * 80)
 
+        # ------------------------------------------------------------
+        # 1) base-only fit
+        # ------------------------------------------------------------
         t0 = time.perf_counter()
-        res = jax_fit_all(
+        res_base = jax_fit_base_one(
+            base="fs",
+            lag=lag,
+            h=h_j,
+            u=u_j,
+            cor_emp=cor_emp_j,
+            par_init=par_init,
+            par_fixed={"nugget": 0.0},
+            **fp_kw,
+            **opt_kw,
+        )
+        dt = time.perf_counter() - t0
+        print_res("base-only", res_base, dt)
+
+        # Build fixed base corr from fitted base parameters
+        base_corr_fit = compute_base_corr(
+            base="fs",
+            par_base=res_base["par_base"],
+            h=h_j,
+            u=u_j,
+        )["base_corr"]
+
+        # ------------------------------------------------------------
+        # 2) lagr-only fit, conditional on fitted base
+        # ------------------------------------------------------------
+        t0 = time.perf_counter()
+        res_lagr = jax_fit_lagr_one(
+            lagrangian="exp",
+            lag=lag,
+            base_corr=base_corr_fit,
+            h_lds=h_lds_j,
+            cor_emp=cor_emp_j,
+            par_init=par_init,
+            par_fixed={"lds_nugget": 0.0},
+            **fp_kw,
+            **opt_kw,
+        )
+        dt = time.perf_counter() - t0
+        print_res("lagr-only | fitted base", res_lagr, dt)
+
+        # ------------------------------------------------------------
+        # 3) joint fit
+        # ------------------------------------------------------------
+        t0 = time.perf_counter()
+        res_joint = jax_fit_all(
             base="fs",
             lagrangian="exp",
             lag=lag,
@@ -187,14 +263,17 @@ for opt_name, opt_kw in opt_list:
             **opt_kw,
         )
         dt = time.perf_counter() - t0
+        print_res("joint fit", res_joint, dt)
 
-        print("sec:", dt)
-        print("converged:", res.get("converged"))
-        print("n_iter:", res.get("n_iter"))
-        print("objective:", res.get("objective"))
-        print("lam:", res.get("lam"))
-        print("par_base:", res.get("par_base"))
-        print("par_lagr:", res.get("par_lagr"))
+        # ------------------------------------------------------------
+        # Optional: compare to truth
+        # ------------------------------------------------------------
+        print("\ntruth")
+        print("par_base_true:", par_base_true)
+        print("par_lagr_true:", par_lagr_true)
+        print("lam_true:", lam_true)
+
+exit()
 
 # # fastest and most accurate
 # t0 = time.perf_counter()

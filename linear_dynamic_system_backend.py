@@ -401,7 +401,267 @@ def stationary_corr_from_model_corrs(
 
 
 # ---------------------------------------------------------------------
-# 8) Fit ALL parameters at once (base + lagr), with stationary-corr correction
+# 8) Fit Base correlation
+# ---------------------------------------------------------------------
+def jax_fit_base_one(
+    *,
+    base: Literal["sep", "fs"],
+    lag: int,
+    h: Any,
+    u: Any,
+    cor_emp: Any,
+    par_init: Dict[str, Any],
+    par_fixed: Optional[Dict[str, Any]] = None,
+    transforms: Optional[Dict[str, Transform]] = None,
+    fp_method: FpMethod = "jaxopt_anderson",
+    fp_control: Optional[Dict[str, Any]] = None,
+    ridge: float = RIDGE,
+    method: str = "auto",
+    maxiter: Optional[int] = 10000,
+    control: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Base-only LDS fit.
+    Fits the base correlation parameters, then applies the stationary-correlation
+    correction through the one-step LDS representation before computing WLS.
+    """
+    control = control or {}
+    fp_control = fp_control or {}
+
+    lag = int(lag)
+    lag_p1 = lag + 1
+
+    h = _as_dtype(h)
+    u = _as_dtype(u)
+    cor_emp = _as_dtype(cor_emp)
+
+    n_loc = h.shape[0]
+    joint_dim = (lag_p1 * n_loc, lag_p1 * n_loc)
+    if tuple(cor_emp.shape) != joint_dim:
+        raise ValueError(
+            f"Unmatching shape for cor_emp, must be {joint_dim}, got {cor_emp.shape}"
+        )
+
+    tf = transforms if transforms is not None else make_transforms()
+
+    base_param_names = ("nugget", "c", "gamma", "a", "alpha", "beta")
+    free_names, x0_free, fixed_uncon = _split_free_fixed(
+        base_param_names, par_init, par_fixed, tf
+    )
+
+    def f(x_free: Array, ridge=ridge) -> Array:
+        x_full = _assemble_full_uncon(x_free, free_names, fixed_uncon, base_param_names)
+        par_all_con = _unconstrained_to_constrained_dict(x_full, base_param_names, tf)
+        par_base = _build_par_base(base, par_all_con)
+
+        corrs_model = cor_base_stat(base=base, par_base=par_base, h=h, u=u)
+        corrs_model = _cov_joint(corrs_model)
+
+        corrs_stat = stationary_corr_from_model_corrs(
+            corrs_model,
+            n=n_loc,
+            lag=lag,
+            fp_method=fp_method,
+            fp_control=fp_control,
+            ridge=ridge,
+        )
+        return _wls_loss(corrs_stat, cor_emp)
+
+    value_and_grad = jax.value_and_grad(f)
+    opt_res = _run_optimizer(
+        value_and_grad, x0_free, method=method, control=control, maxiter=maxiter
+    )
+
+    x_star_free = opt_res["x_star"]
+    x_star_full = _assemble_full_uncon(
+        x_star_free, free_names, fixed_uncon, base_param_names
+    )
+    par_all_hat = _unconstrained_to_constrained_dict(x_star_full, base_param_names, tf)
+    par_base_hat = _build_par_base(base, par_all_hat)
+
+    obj_val = float(f(x_star_free))
+
+    notes_fp = {
+        "fp_method": fp_method,
+        "fp_control": {
+            k: (float(v) if isinstance(v, (int, float)) else v)
+            for k, v in fp_control.items()
+        },
+        "ridge": float(ridge),
+    }
+
+    return _tree_to_py(
+        {
+            "par_base": par_base_hat,
+            "objective": obj_val,
+            "converged": opt_res["converged"],
+            "n_iter": opt_res["n_iter"],
+            "message": opt_res.get("message", ""),
+            "trace": opt_res.get("trace", None),
+            "backend": "jax",
+            "notes": {
+                "stationary_corr": True,
+                "lag": int(lag),
+                "one_step_lds": True,
+                **notes_fp,
+            },
+        }
+    )
+
+
+# ---------------------------------------------------------------------
+# 9) Fit lagr cor
+# ---------------------------------------------------------------------
+def compute_base_corr(
+    *,
+    base: Literal["sep", "fs"],
+    par_base: Dict[str, Any],
+    h: Any,
+    u: Any,
+) -> Dict[str, Any]:
+    """
+    Compute the joint base correlation matrix used as the fixed base component
+    in the LDS lagrangian-only fit.
+
+    Note:
+      This returns the pre-stationary joint base correlation, matching the logic
+      in jax_fit_all where the mixture is formed first and the stationary
+      correction is applied afterward.
+    """
+    h = _as_dtype(h)
+    u = _as_dtype(u)
+
+    corrs_base = cor_base_stat(base=base, par_base=par_base, h=h, u=u)
+    corrs_base = _cov_joint(corrs_base)
+
+    return _tree_to_py({"base_corr": corrs_base})
+
+
+def jax_fit_lagr_one(
+    *,
+    lagrangian: str = "exp",
+    lag: int,
+    base_corr: Any,
+    h_lds: Any,
+    cor_emp: Any,
+    par_init: Dict[str, Any],
+    par_fixed: Optional[Dict[str, Any]] = None,
+    transforms: Optional[Dict[str, Transform]] = None,
+    fp_method: FpMethod = "jaxopt_anderson",
+    fp_control: Optional[Dict[str, Any]] = None,
+    ridge: float = RIDGE,
+    method: str = "auto",
+    maxiter: Optional[int] = 10000,
+    control: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Lagrangian-only LDS fit with fixed base correlation.
+    Forms
+        C_mix = (1 - lam) * base_corr + lam * C_lagr
+    then applies the stationary-correlation correction before WLS.
+    """
+    control = control or {}
+    fp_control = fp_control or {}
+
+    lag = int(lag)
+    lag_p1 = lag + 1
+
+    base_corr = _as_dtype(base_corr)
+    h_lds = _as_dtype(h_lds)
+    cor_emp = _as_dtype(cor_emp)
+
+    joint_dim = tuple(base_corr.shape)
+    if len(joint_dim) != 2 or joint_dim[0] != joint_dim[1]:
+        raise ValueError(
+            f"base_corr must be a square joint correlation matrix, got {base_corr.shape}"
+        )
+
+    n_loc = joint_dim[0] // lag_p1
+    expected_joint_dim = (lag_p1 * n_loc, lag_p1 * n_loc)
+
+    if tuple(h_lds.shape) != expected_joint_dim:
+        raise ValueError(
+            f"Unmatching shape for h_lds, must be {expected_joint_dim}, got {h_lds.shape}"
+        )
+    if tuple(cor_emp.shape) != expected_joint_dim:
+        raise ValueError(
+            f"Unmatching shape for cor_emp, must be {expected_joint_dim}, got {cor_emp.shape}"
+        )
+
+    tf = transforms if transforms is not None else make_transforms()
+
+    lds_param_names = ("lam", "lds_nugget", "lds_c", "lds_gamma")
+    free_names, x0_free, fixed_uncon = _split_free_fixed(
+        lds_param_names, par_init, par_fixed, tf
+    )
+
+    def f(x_free: Array, ridge=ridge) -> Array:
+        x_full = _assemble_full_uncon(x_free, free_names, fixed_uncon, lds_param_names)
+        par_all_con = _unconstrained_to_constrained_dict(x_full, lds_param_names, tf)
+
+        par_lagr, lam = _build_par_lds(lagrangian, par_all_con)
+        corrs_lagr = cor_lagr_lds(
+            lagrangian=lagrangian,
+            par_lagr=par_lagr,
+            h_lds=h_lds,
+        )
+        corrs_model = (1.0 - lam) * base_corr + lam * corrs_lagr
+
+        corrs_stat = stationary_corr_from_model_corrs(
+            corrs_model,
+            n=n_loc,
+            lag=lag,
+            fp_method=fp_method,
+            fp_control=fp_control,
+            ridge=ridge,
+        )
+        return _wls_loss(corrs_stat, cor_emp)
+
+    value_and_grad = jax.value_and_grad(f)
+    opt_res = _run_optimizer(
+        value_and_grad, x0_free, method=method, control=control, maxiter=maxiter
+    )
+
+    x_star_free = opt_res["x_star"]
+    x_star_full = _assemble_full_uncon(
+        x_star_free, free_names, fixed_uncon, lds_param_names
+    )
+    par_all_hat = _unconstrained_to_constrained_dict(x_star_full, lds_param_names, tf)
+    par_lagr_hat, lam_hat = _build_par_lds(lagrangian, par_all_hat)
+
+    obj_val = float(f(x_star_free))
+
+    notes_fp = {
+        "fp_method": fp_method,
+        "fp_control": {
+            k: (float(v) if isinstance(v, (int, float)) else v)
+            for k, v in fp_control.items()
+        },
+        "ridge": float(ridge),
+    }
+
+    return _tree_to_py(
+        {
+            "par_lagr": par_lagr_hat,
+            "lam": lam_hat,
+            "objective": obj_val,
+            "converged": opt_res["converged"],
+            "n_iter": opt_res["n_iter"],
+            "message": opt_res.get("message", ""),
+            "trace": opt_res.get("trace", None),
+            "backend": "jax",
+            "notes": {
+                "stationary_corr": True,
+                "lag": int(lag),
+                "one_step_lds": True,
+                **notes_fp,
+            },
+        }
+    )
+
+
+# ---------------------------------------------------------------------
+# 10) Fit ALL parameters at once (base + lagr), with stationary-corr correction
 # ---------------------------------------------------------------------
 def jax_fit_all(
     *,
@@ -438,6 +698,11 @@ def jax_fit_all(
     lag = int(lag)
     lag_p1 = lag + 1
 
+    h = _as_dtype(h)
+    h_lds = _as_dtype(h_lds)
+    u = _as_dtype(u)
+    cor_emp = _as_dtype(cor_emp)
+
     # --- shape checks ---
     n_loc = h.shape[0]
     joint_dim = (lag_p1 * n_loc, lag_p1 * n_loc)
@@ -449,12 +714,6 @@ def jax_fit_all(
         raise ValueError(
             f"Unmatching shape for h_lds, must be {joint_dim}, got {h_lds.shape}"
         )
-
-    # --- dtypes ---
-    h = _as_dtype(h)
-    h_lds = _as_dtype(h_lds)
-    u = _as_dtype(u)
-    cor_emp = _as_dtype(cor_emp)
 
     tf = transforms if transforms is not None else make_transforms()
 
